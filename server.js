@@ -1,4 +1,5 @@
 const http = require('http');
+const https = require('https');
 const WebSocket = require('ws');
 const url = require('url');
 const fs = require('fs');
@@ -87,7 +88,6 @@ function logRequest(req, statusCode, durationMs) {
 // ===================
 // WEBHOOK QUEUE (in-memory, async delivery)
 // ===================
-const https = require('https');
 const webhookQueue = [];
 
 function deliverWebhook(hook) {
