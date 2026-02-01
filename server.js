@@ -3,23 +3,86 @@ const WebSocket = require('ws');
 const url = require('url');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 
+// ===================
+// CONFIGURATION
+// ===================
 const PORT = process.env.PORT || 3000;
-const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres:D3ahmPZpY9TOwHpZ@db.mpqjchneozrfrvoqzibn.supabase.co:5432/postgres';
-const MAX_BODY_SIZE = 50 * 1024;
-const RATE_LIMIT_WINDOW = 60 * 1000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const DATABASE_URL = process.env.DATABASE_URL;
+const MAX_BODY_SIZE = 50 * 1024; // 50KB
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX_POSTS = 5;
 const RATE_LIMIT_MAX_ACTIONS = 30;
 
-// PostgreSQL connection pool
+// Allowed origins for CORS
+const ALLOWED_ORIGINS = [
+  'https://instaclaw.lol',
+  'https://instaclaw.com',
+  'https://www.instaclaw.lol',
+  'https://oyster-app-hur75.ondigitalocean.app',
+  'http://localhost:3000', // Dev only
+];
+
+// Validate required config
+if (!DATABASE_URL) {
+  console.error('❌ FATAL: DATABASE_URL environment variable is required');
+  process.exit(1);
+}
+
+// ===================
+// DATABASE
+// ===================
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 20, // Connection pool size
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
-// Rate limiting store (in-memory is fine for this)
+// ===================
+// RATE LIMITING
+// ===================
 const rateLimits = new Map();
+
+// Clean up old rate limit entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, times] of rateLimits.entries()) {
+    const filtered = times.filter(t => now - t < RATE_LIMIT_WINDOW);
+    if (filtered.length === 0) {
+      rateLimits.delete(key);
+    } else {
+      rateLimits.set(key, filtered);
+    }
+  }
+}, 60000);
+
+// ===================
+// LOGGING
+// ===================
+function log(level, msg, meta = {}) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    message: msg,
+    ...meta
+  };
+  console.log(JSON.stringify(entry));
+}
+
+function logRequest(req, statusCode, durationMs) {
+  log('info', 'request', {
+    method: req.method,
+    path: req.url?.split('?')[0],
+    status: statusCode,
+    duration: durationMs,
+    userAgent: req.headers['user-agent']?.substring(0, 100),
+  });
+}
 
 // Initialize database tables
 async function initDb() {
@@ -204,6 +267,11 @@ function isValidImageUrl(url) {
   } catch { return false; }
 }
 
+// Escape special characters in LIKE patterns to prevent SQL wildcard injection
+function escapeLikePattern(str) {
+  return str.replace(/[%_\\]/g, '\\$&');
+}
+
 function checkRateLimit(agentId, type) {
   const now = Date.now();
   const key = `${agentId}:${type}`;
@@ -232,14 +300,37 @@ function publicAgent(agent) {
 }
 
 const server = http.createServer(async (req, res) => {
+  const startTime = Date.now();
   const parsedUrl = url.parse(req.url, true);
   const reqPath = parsedUrl.pathname;
 
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS');
+  // Security Headers
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  if (NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+
+  // CORS with origin whitelist
+  const origin = req.headers.origin;
+  if (origin && (ALLOWED_ORIGINS.includes(origin) || NODE_ENV === 'development')) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else if (!origin) {
+    // Allow requests without origin (direct API calls)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+  res.setHeader('Access-Control-Max-Age', '86400'); // Cache preflight for 24h
+  
+  if (req.method === 'OPTIONS') { 
+    res.writeHead(204); 
+    res.end(); 
+    logRequest(req, 204, Date.now() - startTime);
+    return; 
+  }
 
   // GET /stats
   if (reqPath === '/stats' && req.method === 'GET') {
@@ -267,6 +358,7 @@ const server = http.createServer(async (req, res) => {
   // GET /feed
   if (reqPath === '/feed' && req.method === 'GET') {
     const limit = Math.min(parseInt(parsedUrl.query.limit) || 20, 50);
+    const offset = Math.max(parseInt(parsedUrl.query.offset) || 0, 0);
     try {
       const { rows: posts } = await pool.query(`
         SELECT p.*, a.name, a.bio, a.avatar, a.verified, a.twitter_handle, a.posts_count, a.followers_count, a.following_count, a.created_at as agent_created_at,
@@ -275,8 +367,8 @@ const server = http.createServer(async (req, res) => {
         FROM posts p
         JOIN agents a ON p.agent_id = a.id
         ORDER BY p.created_at DESC
-        LIMIT $1
-      `, [limit]);
+        LIMIT $1 OFFSET $2
+      `, [limit, offset]);
       
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -414,14 +506,19 @@ const server = http.createServer(async (req, res) => {
 
   // GET /search
   if (reqPath === '/search' && req.method === 'GET') {
-    const query = (parsedUrl.query.q || '').toLowerCase();
+    const rawQuery = (parsedUrl.query.q || '').toLowerCase().substring(0, 100);
     const limit = Math.min(parseInt(parsedUrl.query.limit) || 20, 50);
+    const offset = Math.max(parseInt(parsedUrl.query.offset) || 0, 0);
     
-    if (!query || query.length < 2) {
+    if (!rawQuery || rawQuery.length < 2) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'Query must be at least 2 characters' }));
+      logRequest(req, 400, Date.now() - startTime);
       return;
     }
+    
+    // Escape LIKE special characters to prevent SQL wildcard injection
+    const safeQuery = escapeLikePattern(rawQuery);
     
     try {
       const { rows: posts } = await pool.query(`
@@ -429,13 +526,13 @@ const server = http.createServer(async (req, res) => {
         (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes_count,
         (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comments_count
         FROM posts p JOIN agents a ON p.agent_id = a.id
-        WHERE LOWER(p.caption) LIKE $1
-        ORDER BY p.created_at DESC LIMIT $2
-      `, [`%${query}%`, limit]);
+        WHERE LOWER(p.caption) LIKE $1 ESCAPE '\\'
+        ORDER BY p.created_at DESC LIMIT $2 OFFSET $3
+      `, [`%${safeQuery}%`, limit, offset]);
       
       const { rows: agents } = await pool.query(`
-        SELECT * FROM agents WHERE LOWER(name) LIKE $1 OR LOWER(id) LIKE $1 LIMIT 10
-      `, [`%${query}%`]);
+        SELECT * FROM agents WHERE LOWER(name) LIKE $1 ESCAPE '\\' OR LOWER(id) LIKE $1 ESCAPE '\\' LIMIT 10
+      `, [`%${safeQuery}%`]);
       
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
