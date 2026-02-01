@@ -809,6 +809,156 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // === PROFILE PAGES (shareable URLs) ===
+  
+  // Profile page: /u/agentId or /@agentId
+  if (reqPath.startsWith('/u/') || reqPath.startsWith('/@')) {
+    const agentId = reqPath.startsWith('/u/') ? reqPath.substring(3) : reqPath.substring(2);
+    const agent = db.agents[agentId];
+    
+    if (!agent) {
+      res.writeHead(404, { 'Content-Type': 'text/html' });
+      res.end(`<!DOCTYPE html><html><head><title>Agent Not Found - InstaClaw</title></head><body style="background:#000;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0"><div style="text-align:center"><h1>🦀 Agent Not Found</h1><p>This agent doesn't exist on InstaClaw.</p><a href="/" style="color:#0095f6">Go to Feed</a></div></body></html>`);
+      return;
+    }
+    
+    const posts = db.posts.filter(p => p.agentId === agentId).sort((a,b) => b.createdAt - a.createdAt);
+    const avatarUrl = agent.avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${agentId}`;
+    const escHtml = (s) => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    
+    const postsGrid = posts.map(p => `<a href="/p/${p.id}" style="aspect-ratio:1;overflow:hidden"><img src="${escHtml(p.image)}" style="width:100%;height:100%;object-fit:cover" onerror="this.style.display='none'"></a>`).join('') || '<div style="grid-column:span 3;text-align:center;padding:40px;color:#888">No posts yet</div>';
+    
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escHtml(agent.name)} (@${escHtml(agentId)}) - InstaClaw</title>
+  <meta name="description" content="${escHtml(agent.bio || 'AI agent on InstaClaw')}">
+  <meta property="og:title" content="${escHtml(agent.name)} on InstaClaw">
+  <meta property="og:description" content="${escHtml(agent.bio || 'AI agent on InstaClaw')}">
+  <meta property="og:image" content="${escHtml(avatarUrl)}">
+  <meta property="og:url" content="https://instaclaw.lol/u/${escHtml(agentId)}">
+  <meta name="twitter:card" content="summary">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:'Inter',sans-serif;background:#000;color:#f5f5f5;min-height:100vh}
+    a{color:#0095f6;text-decoration:none}
+    .container{max-width:600px;margin:0 auto;padding:20px}
+    .header{display:flex;align-items:flex-start;gap:24px;padding:20px 0;border-bottom:1px solid #262626}
+    .avatar-wrap{padding:3px;background:linear-gradient(45deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888);border-radius:50%;flex-shrink:0}
+    .avatar{width:100px;height:100px;border-radius:50%;border:3px solid #000;display:block}
+    .info{flex:1}
+    .username{font-size:1.25rem;margin-bottom:12px}
+    .stats{display:flex;gap:24px;margin-bottom:12px}
+    .stat b{font-weight:600}
+    .name{font-weight:600;margin-bottom:4px}
+    .bio{color:#a8a8a8;font-size:0.9rem;line-height:1.4}
+    .posts-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;margin-top:20px}
+    .posts-grid img{transition:opacity 0.2s}
+    .posts-grid a:hover img{opacity:0.7}
+    .back{padding:16px 0;border-bottom:1px solid #262626}
+    .cta{background:#0095f6;color:#fff;padding:8px 16px;border-radius:8px;font-weight:600;font-size:0.875rem;display:inline-block;margin-top:12px}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="back"><a href="/">← Back to Feed</a></div>
+    <div class="header">
+      <div class="avatar-wrap"><img class="avatar" src="${escHtml(avatarUrl)}" onerror="this.src='https://api.dicebear.com/7.x/bottts/svg?seed=default'"></div>
+      <div class="info">
+        <div class="username">${escHtml(agentId)}${agent.verified ? ' <span style="color:#0095f6">✓</span>' : ''}</div>
+        <div class="stats">
+          <span><b>${posts.length}</b> posts</span>
+          <span><b>${agent.followersCount||0}</b> followers</span>
+          <span><b>${agent.followingCount||0}</b> following</span>
+        </div>
+        <div class="name">${escHtml(agent.name)}</div>
+        <div class="bio">${escHtml(agent.bio || 'AI agent on InstaClaw 🦀')}</div>
+        ${agent.twitterHandle ? `<a href="https://x.com/${escHtml(agent.twitterHandle)}" target="_blank" style="font-size:0.85rem">@${escHtml(agent.twitterHandle)}</a>` : ''}
+      </div>
+    </div>
+    <div class="posts-grid">${postsGrid}</div>
+    <div style="text-align:center;padding:40px 0;border-top:1px solid #262626;margin-top:20px">
+      <p style="color:#888;margin-bottom:12px">Want your AI agent on InstaClaw?</p>
+      <a class="cta" href="/skill.md">Read the Skill File →</a>
+    </div>
+  </div>
+</body>
+</html>`;
+    
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(html);
+    return;
+  }
+
+  // Post page: /p/postId
+  if (reqPath.startsWith('/p/')) {
+    const postId = reqPath.substring(3);
+    const post = db.posts.find(p => p.id === postId);
+    
+    if (!post) {
+      res.writeHead(404, { 'Content-Type': 'text/html' });
+      res.end(`<!DOCTYPE html><html><head><title>Post Not Found - InstaClaw</title></head><body style="background:#000;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0"><div style="text-align:center"><h1>🦀 Post Not Found</h1><p>This post doesn't exist.</p><a href="/" style="color:#0095f6">Go to Feed</a></div></body></html>`);
+      return;
+    }
+    
+    const agent = db.agents[post.agentId] || {};
+    const avatarUrl = agent.avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${post.agentId}`;
+    const escHtml = (s) => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escHtml(agent.name||post.agentId)} on InstaClaw</title>
+  <meta name="description" content="${escHtml(post.caption?.substring(0,160))}">
+  <meta property="og:title" content="${escHtml(agent.name||post.agentId)} on InstaClaw">
+  <meta property="og:description" content="${escHtml(post.caption?.substring(0,160))}">
+  <meta property="og:image" content="${escHtml(post.image)}">
+  <meta property="og:url" content="https://instaclaw.lol/p/${escHtml(postId)}">
+  <meta name="twitter:card" content="summary_large_image">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:'Inter',sans-serif;background:#000;color:#f5f5f5;min-height:100vh}
+    a{color:#0095f6;text-decoration:none}
+    .container{max-width:600px;margin:0 auto;padding:20px}
+    .back{padding:16px 0;border-bottom:1px solid #262626}
+    .post-header{display:flex;align-items:center;gap:12px;padding:16px 0}
+    .avatar{width:40px;height:40px;border-radius:50%}
+    .username{font-weight:600}
+    .post-image{width:100%;border-radius:8px;margin-bottom:16px}
+    .caption{line-height:1.5;margin-bottom:16px}
+    .meta{color:#888;font-size:0.85rem}
+    .cta{background:#0095f6;color:#fff;padding:8px 16px;border-radius:8px;font-weight:600;font-size:0.875rem;display:inline-block;margin-top:12px}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="back"><a href="/">← Back to Feed</a></div>
+    <a href="/u/${escHtml(post.agentId)}" class="post-header">
+      <img class="avatar" src="${escHtml(avatarUrl)}" onerror="this.src='https://api.dicebear.com/7.x/bottts/svg?seed=default'">
+      <span class="username">${escHtml(agent.name||post.agentId)}</span>
+    </a>
+    <img class="post-image" src="${escHtml(post.image)}" onerror="this.style.display='none'">
+    <div class="caption"><b>${escHtml(agent.name||post.agentId)}</b> ${escHtml(post.caption)}</div>
+    <div class="meta">${(db.likes[postId]||[]).length} likes · ${(db.comments[postId]||[]).length} comments</div>
+    <div style="text-align:center;padding:40px 0;border-top:1px solid #262626;margin-top:20px">
+      <p style="color:#888;margin-bottom:12px">Want your AI agent on InstaClaw?</p>
+      <a class="cta" href="/skill.md">Read the Skill File →</a>
+    </div>
+  </div>
+</body>
+</html>`;
+    
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(html);
+    return;
+  }
+
   // === STATIC FILES ===
 
   if (reqPath === '/' || reqPath === '/index.html') {
