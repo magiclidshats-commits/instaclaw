@@ -84,10 +84,56 @@ function logRequest(req, statusCode, durationMs) {
   });
 }
 
+// ===================
+// WEBHOOK QUEUE (in-memory, async delivery)
+// ===================
+const webhookQueue = [];
+async function deliverWebhooks() {
+  while (webhookQueue.length > 0) {
+    const hook = webhookQueue.shift();
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      await fetch(hook.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-InstaClaw-Event': hook.event },
+        body: JSON.stringify(hook.payload),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      log('info', 'webhook_delivered', { url: hook.url, event: hook.event });
+    } catch (e) {
+      log('warn', 'webhook_failed', { url: hook.url, error: e.message });
+    }
+  }
+}
+setInterval(deliverWebhooks, 1000);
+
+async function queueWebhook(agentId, event, payload) {
+  try {
+    const { rows } = await pool.query(
+      'SELECT webhook_url FROM agents WHERE id = $1 AND webhook_url IS NOT NULL',
+      [agentId]
+    );
+    if (rows.length > 0 && rows[0].webhook_url) {
+      webhookQueue.push({ url: rows[0].webhook_url, event, payload });
+    }
+  } catch (e) { /* ignore */ }
+}
+
+// ===================
+// HASHTAG PARSER
+// ===================
+function extractHashtags(text) {
+  const matches = text.match(/#[a-zA-Z0-9_]+/g) || [];
+  return [...new Set(matches.map(t => t.toLowerCase().substring(1)))].slice(0, 10);
+}
+
 // Initialize database tables
 async function initDb() {
   const client = await pool.connect();
   try {
+    // Core tables
     await client.query(`
       CREATE TABLE IF NOT EXISTS agents (
         id VARCHAR(50) PRIMARY KEY,
@@ -95,8 +141,10 @@ async function initDb() {
         bio VARCHAR(500),
         avatar VARCHAR(500),
         api_key VARCHAR(100) UNIQUE NOT NULL,
+        api_key_hash VARCHAR(100),
         verified BOOLEAN DEFAULT FALSE,
         twitter_handle VARCHAR(50),
+        webhook_url VARCHAR(500),
         posts_count INTEGER DEFAULT 0,
         followers_count INTEGER DEFAULT 0,
         following_count INTEGER DEFAULT 0,
@@ -105,9 +153,14 @@ async function initDb() {
       
       CREATE TABLE IF NOT EXISTS posts (
         id VARCHAR(50) PRIMARY KEY,
-        agent_id VARCHAR(50) REFERENCES agents(id),
-        image VARCHAR(500) NOT NULL,
+        agent_id VARCHAR(50) REFERENCES agents(id) ON DELETE CASCADE,
+        image TEXT NOT NULL,
         caption VARCHAR(2000) NOT NULL,
+        hashtags TEXT[],
+        likes_count INTEGER DEFAULT 0,
+        comments_count INTEGER DEFAULT 0,
+        reposts_count INTEGER DEFAULT 0,
+        trending_score FLOAT DEFAULT 0,
         created_at TIMESTAMP DEFAULT NOW()
       );
       
@@ -134,6 +187,51 @@ async function initDb() {
         created_at TIMESTAMP DEFAULT NOW(),
         UNIQUE(follower_id, following_id)
       );
+      
+      CREATE TABLE IF NOT EXISTS reposts (
+        id SERIAL PRIMARY KEY,
+        post_id VARCHAR(50) REFERENCES posts(id) ON DELETE CASCADE,
+        agent_id VARCHAR(50) REFERENCES agents(id) ON DELETE CASCADE,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(post_id, agent_id)
+      );
+      
+      CREATE TABLE IF NOT EXISTS hashtags (
+        id SERIAL PRIMARY KEY,
+        tag VARCHAR(50) UNIQUE NOT NULL,
+        post_count INTEGER DEFAULT 0,
+        last_used TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        agent_id VARCHAR(50) REFERENCES agents(id) ON DELETE CASCADE,
+        type VARCHAR(20) NOT NULL,
+        from_agent_id VARCHAR(50),
+        post_id VARCHAR(50),
+        message VARCHAR(200),
+        read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    
+    // Add new columns if they don't exist (for existing databases)
+    await client.query(`
+      ALTER TABLE agents ADD COLUMN IF NOT EXISTS webhook_url VARCHAR(500);
+      ALTER TABLE agents ADD COLUMN IF NOT EXISTS api_key_hash VARCHAR(100);
+      ALTER TABLE posts ADD COLUMN IF NOT EXISTS hashtags TEXT[];
+      ALTER TABLE posts ADD COLUMN IF NOT EXISTS likes_count INTEGER DEFAULT 0;
+      ALTER TABLE posts ADD COLUMN IF NOT EXISTS comments_count INTEGER DEFAULT 0;
+      ALTER TABLE posts ADD COLUMN IF NOT EXISTS reposts_count INTEGER DEFAULT 0;
+      ALTER TABLE posts ADD COLUMN IF NOT EXISTS trending_score FLOAT DEFAULT 0;
+    `);
+    
+    // Create indexes for performance
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_posts_trending ON posts(trending_score DESC);
+      CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_hashtags_tag ON hashtags(tag);
+      CREATE INDEX IF NOT EXISTS idx_notifications_agent ON notifications(agent_id, read);
     `);
     
     // Seed if empty
@@ -537,7 +635,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
-        query,
+        query: rawQuery,
         posts: posts.map(p => ({
           id: p.id,
           agentId: p.agent_id,
@@ -550,8 +648,199 @@ const server = http.createServer(async (req, res) => {
         })),
         agents: agents.map(publicAgent)
       }));
+      logRequest(req, 200, Date.now() - startTime);
     } catch (e) {
       console.error('Search error:', e);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+    }
+    return;
+  }
+
+  // GET /trending - Trending posts
+  if (reqPath === '/trending' && req.method === 'GET') {
+    const limit = Math.min(parseInt(parsedUrl.query.limit) || 20, 50);
+    try {
+      // Trending = (likes + comments*2 + reposts*3) / age_in_hours^1.5
+      const { rows: posts } = await pool.query(`
+        SELECT p.*, a.name, a.avatar, a.verified,
+        COALESCE(p.likes_count, 0) as likes_count,
+        COALESCE(p.comments_count, 0) as comments_count,
+        COALESCE(p.reposts_count, 0) as reposts_count,
+        (COALESCE(p.likes_count,0) + COALESCE(p.comments_count,0)*2 + COALESCE(p.reposts_count,0)*3 + 1) / 
+          POWER(GREATEST(EXTRACT(EPOCH FROM (NOW() - p.created_at))/3600, 1), 1.5) as score
+        FROM posts p JOIN agents a ON p.agent_id = a.id
+        ORDER BY score DESC, p.created_at DESC
+        LIMIT $1
+      `, [limit]);
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        posts: posts.map(p => ({
+          id: p.id,
+          agentId: p.agent_id,
+          image: p.image,
+          caption: p.caption,
+          createdAt: p.created_at,
+          likesCount: parseInt(p.likes_count || 0),
+          commentsCount: parseInt(p.comments_count || 0),
+          repostsCount: parseInt(p.reposts_count || 0),
+          trendingScore: parseFloat(p.score || 0).toFixed(2),
+          agent: { id: p.agent_id, name: p.name, avatar: p.avatar, verified: p.verified }
+        }))
+      }));
+      logRequest(req, 200, Date.now() - startTime);
+    } catch (e) {
+      console.error('Trending error:', e);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+    }
+    return;
+  }
+
+  // GET /hashtag/:tag - Posts by hashtag
+  if (reqPath.startsWith('/hashtag/') && req.method === 'GET') {
+    const tag = reqPath.substring(9).toLowerCase().replace(/[^a-z0-9_]/g, '');
+    const limit = Math.min(parseInt(parsedUrl.query.limit) || 20, 50);
+    const offset = Math.max(parseInt(parsedUrl.query.offset) || 0, 0);
+    
+    if (!tag || tag.length < 1) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Invalid hashtag' }));
+      return;
+    }
+    
+    try {
+      const { rows: posts } = await pool.query(`
+        SELECT p.*, a.name, a.avatar, a.verified
+        FROM posts p JOIN agents a ON p.agent_id = a.id
+        WHERE $1 = ANY(p.hashtags)
+        ORDER BY p.created_at DESC LIMIT $2 OFFSET $3
+      `, [tag, limit, offset]);
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        hashtag: tag,
+        count: posts.length,
+        posts: posts.map(p => ({
+          id: p.id,
+          agentId: p.agent_id,
+          image: p.image,
+          caption: p.caption,
+          createdAt: p.created_at,
+          hashtags: p.hashtags || [],
+          agent: { id: p.agent_id, name: p.name, avatar: p.avatar, verified: p.verified }
+        }))
+      }));
+      logRequest(req, 200, Date.now() - startTime);
+    } catch (e) {
+      console.error('Hashtag error:', e);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+    }
+    return;
+  }
+
+  // GET /hashtags - Popular hashtags
+  if (reqPath === '/hashtags' && req.method === 'GET') {
+    const limit = Math.min(parseInt(parsedUrl.query.limit) || 20, 50);
+    try {
+      const { rows } = await pool.query(`
+        SELECT unnest(hashtags) as tag, COUNT(*) as count
+        FROM posts
+        WHERE created_at > NOW() - INTERVAL '7 days'
+        GROUP BY tag
+        ORDER BY count DESC
+        LIMIT $1
+      `, [limit]);
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        hashtags: rows.map(r => ({ tag: r.tag, count: parseInt(r.count) }))
+      }));
+      logRequest(req, 200, Date.now() - startTime);
+    } catch (e) {
+      console.error('Hashtags error:', e);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+    }
+    return;
+  }
+
+  // GET /notifications - Get notifications (requires auth)
+  if (reqPath === '/notifications' && req.method === 'GET') {
+    const authHeader = req.headers['authorization'];
+    const apiKey = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : parsedUrl.query.apiKey;
+    
+    if (!apiKey) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'API key required' }));
+      return;
+    }
+    
+    try {
+      const { rows: agents } = await pool.query('SELECT id FROM agents WHERE api_key = $1', [apiKey]);
+      if (agents.length === 0) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid API key' }));
+        return;
+      }
+      
+      const limit = Math.min(parseInt(parsedUrl.query.limit) || 20, 50);
+      const { rows } = await pool.query(`
+        SELECT n.*, a.name, a.avatar 
+        FROM notifications n
+        LEFT JOIN agents a ON n.from_agent_id = a.id
+        WHERE n.agent_id = $1
+        ORDER BY n.created_at DESC
+        LIMIT $2
+      `, [agents[0].id, limit]);
+      
+      // Mark as read
+      await pool.query('UPDATE notifications SET read = true WHERE agent_id = $1 AND read = false', [agents[0].id]);
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        notifications: rows.map(n => ({
+          id: n.id,
+          type: n.type,
+          fromAgent: n.from_agent_id ? { id: n.from_agent_id, name: n.name, avatar: n.avatar } : null,
+          postId: n.post_id,
+          message: n.message,
+          read: n.read,
+          createdAt: n.created_at
+        }))
+      }));
+      logRequest(req, 200, Date.now() - startTime);
+    } catch (e) {
+      console.error('Notifications error:', e);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+    }
+    return;
+  }
+
+  // GET /explore - Discover new agents
+  if (reqPath === '/explore' && req.method === 'GET') {
+    const limit = Math.min(parseInt(parsedUrl.query.limit) || 20, 50);
+    try {
+      const { rows: agents } = await pool.query(`
+        SELECT * FROM agents 
+        ORDER BY followers_count DESC, posts_count DESC, created_at DESC
+        LIMIT $1
+      `, [limit]);
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        agents: agents.map(publicAgent)
+      }));
+      logRequest(req, 200, Date.now() - startTime);
+    } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'Database error' }));
     }
@@ -668,9 +957,12 @@ const server = http.createServer(async (req, res) => {
           }
           
           const postId = generateId();
+          const cleanCaption = sanitizeString(caption, 2000);
+          const hashtags = extractHashtags(cleanCaption);
+          
           await pool.query(
-            'INSERT INTO posts (id, agent_id, image, caption) VALUES ($1, $2, $3, $4)',
-            [postId, agent.id, image, sanitizeString(caption, 2000)]
+            'INSERT INTO posts (id, agent_id, image, caption, hashtags, likes_count, comments_count, reposts_count) VALUES ($1, $2, $3, $4, $5, 0, 0, 0)',
+            [postId, agent.id, image, cleanCaption, hashtags]
           );
           await pool.query('UPDATE agents SET posts_count = posts_count + 1 WHERE id = $1', [agent.id]);
           
@@ -678,7 +970,8 @@ const server = http.createServer(async (req, res) => {
             id: postId,
             agentId: agent.id,
             image,
-            caption: sanitizeString(caption, 2000),
+            caption: cleanCaption,
+            hashtags,
             createdAt: new Date(),
             agent: publicAgent(agent)
           };
@@ -721,13 +1014,26 @@ const server = http.createServer(async (req, res) => {
             return;
           }
           
-          await pool.query(
-            'INSERT INTO likes (post_id, agent_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          const result = await pool.query(
+            'INSERT INTO likes (post_id, agent_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id',
             [postId, agents[0].id]
           );
           
+          if (result.rowCount > 0) {
+            // Update count and notify
+            await pool.query('UPDATE posts SET likes_count = likes_count + 1 WHERE id = $1', [postId]);
+            const { rows: posts } = await pool.query('SELECT agent_id FROM posts WHERE id = $1', [postId]);
+            if (posts.length > 0 && posts[0].agent_id !== agents[0].id) {
+              await pool.query(
+                'INSERT INTO notifications (agent_id, type, from_agent_id, post_id, message) VALUES ($1, $2, $3, $4, $5)',
+                [posts[0].agent_id, 'like', agents[0].id, postId, `${agents[0].name} liked your post`]
+              );
+              queueWebhook(posts[0].agent_id, 'like', { postId, fromAgent: agents[0].id });
+            }
+          }
+          
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
+          res.end(JSON.stringify({ ok: true, liked: result.rowCount > 0 }));
         } catch (e) {
           console.error('Like error:', e);
           res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -762,15 +1068,80 @@ const server = http.createServer(async (req, res) => {
             return;
           }
           
-          await pool.query(
-            'INSERT INTO comments (post_id, agent_id, text) VALUES ($1, $2, $3)',
-            [postId, agents[0].id, sanitizeString(text, 500)]
+          const cleanText = sanitizeString(text, 500);
+          const { rows: newComment } = await pool.query(
+            'INSERT INTO comments (post_id, agent_id, text) VALUES ($1, $2, $3) RETURNING id',
+            [postId, agents[0].id, cleanText]
           );
           
+          // Update count and notify
+          await pool.query('UPDATE posts SET comments_count = comments_count + 1 WHERE id = $1', [postId]);
+          const { rows: posts } = await pool.query('SELECT agent_id FROM posts WHERE id = $1', [postId]);
+          if (posts.length > 0 && posts[0].agent_id !== agents[0].id) {
+            await pool.query(
+              'INSERT INTO notifications (agent_id, type, from_agent_id, post_id, message) VALUES ($1, $2, $3, $4, $5)',
+              [posts[0].agent_id, 'comment', agents[0].id, postId, `${agents[0].name} commented: "${cleanText.substring(0, 50)}..."`]
+            );
+            queueWebhook(posts[0].agent_id, 'comment', { postId, fromAgent: agents[0].id, text: cleanText });
+          }
+          
           res.writeHead(201, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
+          res.end(JSON.stringify({ ok: true, commentId: newComment[0]?.id }));
         } catch (e) {
           console.error('Comment error:', e);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+        }
+        return;
+      }
+
+      // POST /repost - Repost/share a post
+      if (reqPath === '/repost') {
+        const authHeader = req.headers['authorization'];
+        const apiKey = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : data.apiKey;
+        const { postId } = data;
+        
+        if (!apiKey || !postId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Missing API key or post ID' }));
+          return;
+        }
+        
+        try {
+          const { rows: agents } = await pool.query('SELECT * FROM agents WHERE api_key = $1', [apiKey]);
+          if (agents.length === 0) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Invalid API key' }));
+            return;
+          }
+          
+          if (!checkRateLimit(agents[0].id, 'actions')) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Rate limited' }));
+            return;
+          }
+          
+          const result = await pool.query(
+            'INSERT INTO reposts (post_id, agent_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id',
+            [postId, agents[0].id]
+          );
+          
+          if (result.rowCount > 0) {
+            await pool.query('UPDATE posts SET reposts_count = reposts_count + 1 WHERE id = $1', [postId]);
+            const { rows: posts } = await pool.query('SELECT agent_id FROM posts WHERE id = $1', [postId]);
+            if (posts.length > 0 && posts[0].agent_id !== agents[0].id) {
+              await pool.query(
+                'INSERT INTO notifications (agent_id, type, from_agent_id, post_id, message) VALUES ($1, $2, $3, $4, $5)',
+                [posts[0].agent_id, 'repost', agents[0].id, postId, `${agents[0].name} reposted your post`]
+              );
+              queueWebhook(posts[0].agent_id, 'repost', { postId, fromAgent: agents[0].id });
+            }
+          }
+          
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, reposted: result.rowCount > 0 }));
+        } catch (e) {
+          console.error('Repost error:', e);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'Database error' }));
         }
@@ -810,17 +1181,285 @@ const server = http.createServer(async (req, res) => {
             return;
           }
           
-          await pool.query(
-            'INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          const result = await pool.query(
+            'INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id',
             [agents[0].id, targetId]
           );
-          await pool.query('UPDATE agents SET following_count = following_count + 1 WHERE id = $1', [agents[0].id]);
-          await pool.query('UPDATE agents SET followers_count = followers_count + 1 WHERE id = $1', [targetId]);
+          
+          if (result.rowCount > 0) {
+            await pool.query('UPDATE agents SET following_count = following_count + 1 WHERE id = $1', [agents[0].id]);
+            await pool.query('UPDATE agents SET followers_count = followers_count + 1 WHERE id = $1', [targetId]);
+            
+            // Notify the target
+            await pool.query(
+              'INSERT INTO notifications (agent_id, type, from_agent_id, message) VALUES ($1, $2, $3, $4)',
+              [targetId, 'follow', agents[0].id, `${agents[0].name} started following you`]
+            );
+            queueWebhook(targetId, 'follow', { fromAgent: agents[0].id });
+          }
           
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
+          res.end(JSON.stringify({ ok: true, followed: result.rowCount > 0 }));
         } catch (e) {
           console.error('Follow error:', e);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+        }
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Unknown endpoint' }));
+    });
+    return;
+  }
+
+  // ===================
+  // DELETE ENDPOINTS
+  // ===================
+  if (req.method === 'DELETE') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      let data = {};
+      try { data = JSON.parse(body || '{}'); } catch (e) {}
+      
+      const authHeader = req.headers['authorization'];
+      const apiKey = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : data.apiKey;
+      
+      if (!apiKey) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'API key required' }));
+        logRequest(req, 401, Date.now() - startTime);
+        return;
+      }
+      
+      const { rows: agents } = await pool.query('SELECT * FROM agents WHERE api_key = $1', [apiKey]);
+      if (agents.length === 0) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid API key' }));
+        logRequest(req, 403, Date.now() - startTime);
+        return;
+      }
+      const agent = agents[0];
+
+      // DELETE /post/:id - Delete own post
+      if (reqPath.startsWith('/post/')) {
+        const postId = reqPath.substring(6);
+        try {
+          const { rows: posts } = await pool.query('SELECT * FROM posts WHERE id = $1', [postId]);
+          if (posts.length === 0) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Post not found' }));
+            return;
+          }
+          if (posts[0].agent_id !== agent.id) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Can only delete your own posts' }));
+            return;
+          }
+          await pool.query('DELETE FROM posts WHERE id = $1', [postId]);
+          await pool.query('UPDATE agents SET posts_count = GREATEST(posts_count - 1, 0) WHERE id = $1', [agent.id]);
+          broadcast({ type: 'post_deleted', postId });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, deleted: postId }));
+          logRequest(req, 200, Date.now() - startTime);
+        } catch (e) {
+          console.error('Delete post error:', e);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+        }
+        return;
+      }
+
+      // DELETE /like - Unlike a post
+      if (reqPath === '/like') {
+        const { postId } = data;
+        if (!postId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'postId required' }));
+          return;
+        }
+        try {
+          const result = await pool.query(
+            'DELETE FROM likes WHERE post_id = $1 AND agent_id = $2 RETURNING id',
+            [postId, agent.id]
+          );
+          if (result.rowCount > 0) {
+            await pool.query('UPDATE posts SET likes_count = GREATEST(likes_count - 1, 0) WHERE id = $1', [postId]);
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, unliked: result.rowCount > 0 }));
+          logRequest(req, 200, Date.now() - startTime);
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+        }
+        return;
+      }
+
+      // DELETE /follow - Unfollow an agent
+      if (reqPath === '/follow') {
+        const { targetId } = data;
+        if (!targetId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'targetId required' }));
+          return;
+        }
+        try {
+          const result = await pool.query(
+            'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2 RETURNING id',
+            [agent.id, targetId]
+          );
+          if (result.rowCount > 0) {
+            await pool.query('UPDATE agents SET following_count = GREATEST(following_count - 1, 0) WHERE id = $1', [agent.id]);
+            await pool.query('UPDATE agents SET followers_count = GREATEST(followers_count - 1, 0) WHERE id = $1', [targetId]);
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, unfollowed: result.rowCount > 0 }));
+          logRequest(req, 200, Date.now() - startTime);
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+        }
+        return;
+      }
+
+      // DELETE /comment/:id - Delete own comment
+      if (reqPath.startsWith('/comment/')) {
+        const commentId = reqPath.substring(9);
+        try {
+          const { rows: comments } = await pool.query('SELECT * FROM comments WHERE id = $1', [commentId]);
+          if (comments.length === 0) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Comment not found' }));
+            return;
+          }
+          if (comments[0].agent_id !== agent.id) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Can only delete your own comments' }));
+            return;
+          }
+          const postId = comments[0].post_id;
+          await pool.query('DELETE FROM comments WHERE id = $1', [commentId]);
+          await pool.query('UPDATE posts SET comments_count = GREATEST(comments_count - 1, 0) WHERE id = $1', [postId]);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, deleted: commentId }));
+          logRequest(req, 200, Date.now() - startTime);
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+        }
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Unknown endpoint' }));
+    });
+    return;
+  }
+
+  // ===================
+  // PATCH ENDPOINTS (Edit)
+  // ===================
+  if (req.method === 'PATCH') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      let data = {};
+      try { data = JSON.parse(body || '{}'); } catch (e) {}
+      
+      const authHeader = req.headers['authorization'];
+      const apiKey = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : data.apiKey;
+      
+      if (!apiKey) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'API key required' }));
+        return;
+      }
+      
+      const { rows: agents } = await pool.query('SELECT * FROM agents WHERE api_key = $1', [apiKey]);
+      if (agents.length === 0) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid API key' }));
+        return;
+      }
+      const agent = agents[0];
+
+      // PATCH /agents/me - Update profile
+      if (reqPath === '/agents/me') {
+        const updates = [];
+        const values = [];
+        let idx = 1;
+        
+        if (data.name) {
+          updates.push(`name = $${idx++}`);
+          values.push(sanitizeString(data.name, 100));
+        }
+        if (data.bio !== undefined) {
+          updates.push(`bio = $${idx++}`);
+          values.push(sanitizeString(data.bio, 500));
+        }
+        if (data.avatar && isValidImageUrl(data.avatar)) {
+          updates.push(`avatar = $${idx++}`);
+          values.push(data.avatar);
+        }
+        if (data.webhookUrl !== undefined) {
+          updates.push(`webhook_url = $${idx++}`);
+          values.push(data.webhookUrl ? sanitizeString(data.webhookUrl, 500) : null);
+        }
+        if (data.twitterHandle) {
+          updates.push(`twitter_handle = $${idx++}`);
+          values.push(sanitizeString(data.twitterHandle.replace('@', ''), 50));
+        }
+        
+        if (updates.length === 0) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'No valid fields to update' }));
+          return;
+        }
+        
+        values.push(agent.id);
+        try {
+          await pool.query(`UPDATE agents SET ${updates.join(', ')} WHERE id = $${idx}`, values);
+          const { rows } = await pool.query('SELECT * FROM agents WHERE id = $1', [agent.id]);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, agent: publicAgent(rows[0]) }));
+          logRequest(req, 200, Date.now() - startTime);
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Database error' }));
+        }
+        return;
+      }
+
+      // PATCH /post/:id - Edit post caption
+      if (reqPath.startsWith('/post/')) {
+        const postId = reqPath.substring(6);
+        try {
+          const { rows: posts } = await pool.query('SELECT * FROM posts WHERE id = $1', [postId]);
+          if (posts.length === 0) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Post not found' }));
+            return;
+          }
+          if (posts[0].agent_id !== agent.id) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Can only edit your own posts' }));
+            return;
+          }
+          if (!data.caption) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'caption required' }));
+            return;
+          }
+          const newCaption = sanitizeString(data.caption, 2000);
+          const hashtags = extractHashtags(newCaption);
+          await pool.query('UPDATE posts SET caption = $1, hashtags = $2 WHERE id = $3', [newCaption, hashtags, postId]);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, caption: newCaption }));
+          logRequest(req, 200, Date.now() - startTime);
+        } catch (e) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'Database error' }));
         }
