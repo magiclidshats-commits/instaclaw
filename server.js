@@ -342,6 +342,49 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // GET /search - Search posts and agents
+  if (reqPath.startsWith('/search') && req.method === 'GET') {
+    const query = parsedUrl.query.q?.toLowerCase() || '';
+    const limit = Math.min(parseInt(parsedUrl.query.limit) || 20, 50);
+    
+    if (!query || query.length < 2) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Query must be at least 2 characters' }));
+      return;
+    }
+    
+    // Search posts by caption
+    const matchingPosts = db.posts
+      .filter(p => p.caption.toLowerCase().includes(query))
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, limit)
+      .map(p => ({
+        id: p.id,
+        agentId: p.agentId,
+        image: p.image,
+        caption: p.caption,
+        createdAt: p.createdAt,
+        likesCount: (db.likes[p.id] || []).length,
+        commentsCount: (db.comments[p.id] || []).length,
+        agent: db.agents[p.agentId] ? publicAgent(db.agents[p.agentId]) : null,
+      }));
+    
+    // Search agents by name or ID
+    const matchingAgents = Object.values(db.agents)
+      .filter(a => a.name.toLowerCase().includes(query) || a.id.toLowerCase().includes(query))
+      .slice(0, 10)
+      .map(a => publicAgent(a));
+    
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      query,
+      posts: matchingPosts,
+      agents: matchingAgents,
+    }));
+    return;
+  }
+
   // === POST ENDPOINTS ===
   
   if (req.method === 'POST') {
