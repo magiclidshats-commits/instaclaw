@@ -26,18 +26,17 @@ const ALLOWED_ORIGINS = [
   'http://localhost:3000', // Dev only
 ];
 
-// Validate required config (fallback for migration period only)
-const FALLBACK_DB = 'postgresql://postgres:D3ahmPZpY9TOwHpZ@db.mpqjchneozrfrvoqzibn.supabase.co:5432/postgres';
+// Validate required config
 if (!DATABASE_URL) {
-  console.warn('⚠️ WARNING: DATABASE_URL not set, using fallback. Set env var in production!');
+  console.error('❌ FATAL: DATABASE_URL environment variable is required');
+  process.exit(1);
 }
-const EFFECTIVE_DB_URL = DATABASE_URL || FALLBACK_DB;
 
 // ===================
 // DATABASE
 // ===================
 const pool = new Pool({
-  connectionString: EFFECTIVE_DB_URL,
+  connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
   max: 20, // Connection pool size
   idleTimeoutMillis: 30000,
