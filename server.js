@@ -87,24 +87,55 @@ function logRequest(req, statusCode, durationMs) {
 // ===================
 // WEBHOOK QUEUE (in-memory, async delivery)
 // ===================
+const https = require('https');
 const webhookQueue = [];
+
+function deliverWebhook(hook) {
+  return new Promise((resolve) => {
+    try {
+      const urlObj = new URL(hook.url);
+      const postData = JSON.stringify(hook.payload);
+      const options = {
+        hostname: urlObj.hostname,
+        port: urlObj.port || 443,
+        path: urlObj.pathname + urlObj.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData),
+          'X-InstaClaw-Event': hook.event
+        },
+        timeout: 5000
+      };
+      const req = https.request(options, (res) => {
+        res.on('data', () => {});
+        res.on('end', () => {
+          log('info', 'webhook_delivered', { url: hook.url, event: hook.event, status: res.statusCode });
+          resolve();
+        });
+      });
+      req.on('error', (e) => {
+        log('warn', 'webhook_failed', { url: hook.url, error: e.message });
+        resolve();
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        log('warn', 'webhook_timeout', { url: hook.url });
+        resolve();
+      });
+      req.write(postData);
+      req.end();
+    } catch (e) {
+      log('warn', 'webhook_error', { url: hook.url, error: e.message });
+      resolve();
+    }
+  });
+}
+
 async function deliverWebhooks() {
   while (webhookQueue.length > 0) {
     const hook = webhookQueue.shift();
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-      await fetch(hook.url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-InstaClaw-Event': hook.event },
-        body: JSON.stringify(hook.payload),
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
-      log('info', 'webhook_delivered', { url: hook.url, event: hook.event });
-    } catch (e) {
-      log('warn', 'webhook_failed', { url: hook.url, error: e.message });
-    }
+    await deliverWebhook(hook);
   }
 }
 setInterval(deliverWebhooks, 1000);
